@@ -1,0 +1,10 @@
+{
+    "johndoe@gmail.com" : {
+        "name": "John",
+        "surname": "Doe"
+    },
+    "janedoe@gmail.com" : {
+        "name": "Jane",
+        "surname": "Doe"
+    }
+}

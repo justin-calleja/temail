@@ -1,0 +1,174 @@
+#!/usr/bin/env node
+
+"use strict";
+
+require("babel/polyfill");
+
+var path                   = require("path")
+  , fs                     = require("fs")
+  , nodemailer             = require("nodemailer")
+  , Handlebars             = require("handlebars")
+  , inquirer               = require("inquirer")
+  , program                = require("commander")
+  , osenv                  = require("osenv")
+  , bunyan                 = require("bunyan")
+  , _                      = require("lodash")
+  , utils                  = require("./utils")
+  , NoTemplateDataError    = require("./errors/NoTemplateDataError")
+  , TemailConf             = require("./TemailConf");
+
+process.on("uncaughtException", function (err) {
+  console.log(`\n${err.message}\n`);
+});
+
+// Uses nodemailer, so these options are available: 
+//    https://github.com/andris9/nodemailer-smtp-transport#usage
+
+program
+  .version("0.0.1")
+  .option("--template [value]", "path to file containing email body as handlebars template")
+  .option("--data [value]", "path to file containing JSON data to use during template compilation")
+  .option("--service", "One of the services supported by Nodemailer (https://github.com/andris9/nodemailer-wellknown#supported-services)")
+  .option("--email [value]", "the email account to use to send emails with")
+  .option("--from [value]", "the `from` field in the email being sent")
+  .option("--to [value]", "the `to` field in the email being sent (comma separated)")
+  .option("--subject [value]", "the `subject` field in the email being sent")
+  .option("--log-level [value]", "sets the log level for temail (only use to debug temail) [off]", "off")
+  .option("--log-path [value]", "sets the path to the log file for temail to log to (only use to debug temail) [temail.log]", "temail.log")
+  .parse(process.argv);
+
+var log = bunyan.createLogger({
+  name: path.basename(__filename),
+  streams: program.logLevel === "off" ? [] : [
+    {
+      level: program.logLevel,
+      path: program.logPath
+    }
+  ]
+});
+
+log.info("Start");
+var temailConf = new TemailConf({ log });
+log.trace("About to overwrite conf with program options");
+temailConf.overwriteUnlessUndefined({
+  template: program.template,
+  data: program.data,
+  service: program.service,
+  email: program.email,
+  from: program.from,
+  to: program.to,
+  subject: program.subject
+});
+
+log.trace("Configuration resolution from file and program options complete. Moving on to inquire user for any additional necessary info");
+
+var passwordQuestion = {
+  type: "password",
+  name: "password",
+  message: "Password for email:"
+};
+
+var questions = [for (confField of temailConf.missingConfFields()) temailConf.questionFor(confField)];
+
+var actions = [
+
+  // async
+  function promptUserAction(next, temailConf) {
+    inquirer.prompt([...questions, passwordQuestion], function promptCb(answers) {
+        next(answers, temailConf);
+      }
+    );
+  },
+
+  function overwriteConfWithPromptAnswersAction(next, answers, temailConf) {
+    var { password } = answers;
+    delete answers.password;
+
+    overwriteConfWithPromptAnswers(answers, temailConf);
+    next(temailConf, password);
+  },
+
+  function checkForMissingConfFieldsAction(next, temailConf, password) {
+    if(!_.isEmpty( temailConf.missingConfFields() )) {
+      utils.logAndError(log, `ERROR: temail cannot continue without the following: ${temailConf.missingConfFields()}`);
+    }
+    next(temailConf, password);
+  },
+
+  function readTemplateFile(next, temailConf, password) {
+    fs.readFile(temailConf.template, "utf-8", function (err, tplStr) {
+      if (err) throw err;
+      next(temailConf, password, tplStr);
+    });
+  },
+
+  function readDataFile(next, temailConf, password, tplStr) {
+    fs.readFile(temailConf.data, "utf-8", function (err, dataStr) {
+      if (err) throw err;
+      next(temailConf, password, tplStr, dataStr);
+    });
+  },
+
+  function compileTemplatesAction(next, temailConf, password, tplStr, dataStr) {
+    var jsonData = JSON.parse(dataStr);
+    (function ({ hasDataForAllRecip, missingRecip }) {
+      if (!hasDataForAllRecip) {
+        throw new NoTemplateDataError(missingRecip);
+      }
+    }) (temailConf.hasDataForAllRecip(jsonData));
+
+    var template = Handlebars.compile(tplStr);
+
+    for (let recipient in jsonData) {
+      if (jsonData.hasOwnProperty(recipient)) {
+        jsonData[recipient].compiledTemplate = template(jsonData[recipient]);
+      }
+    }
+
+    next(temailConf, password, jsonData);
+
+  },
+
+  // async
+  function sendEmails(temailConf, password, jsonData) {
+    var transport = nodemailer.createTransport({
+      service: temailConf.service,
+      auth: {
+        user: temailConf.email,
+        pass: password
+      }
+    });
+    for (let recipient in jsonData) {
+      if (jsonData.hasOwnProperty(recipient)) {
+        transport.sendMail({
+          from: temailConf.from,
+          to: recipient,
+          subject: temailConf.subject,
+          html: jsonData[recipient].compiledTemplate
+        }, function(err, responseStatus) {
+          if (err) {
+            console.log(err);
+          } else {
+            console.log(`Done sending to ${recipient}`);
+          }
+        });
+
+      }
+    }
+  }
+
+];
+
+// kick off actions
+_.reduceRight(actions, _.wrap)(temailConf);
+
+function overwriteConfWithPromptAnswers(answers, temailConf) {
+  if(answers.password === undefined) {
+    log.trace("About to overwrite conf with user supplied values after inquiring. Password intentionally left out to avoid logging.");
+    temailConf.overwriteUnlessUndefined( answers );
+    log.info({ conf: temailConf.conf }, "Config state after which no more config changes are expected");
+  } else {
+    utils.logAndError(log, "Cannot merge password into main configuration as it might get logged. This is a problem with temail - please open an issue");
+  }
+}
+
